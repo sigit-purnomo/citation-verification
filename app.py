@@ -65,18 +65,18 @@ def cached_text(data: bytes, name: str) -> str:
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
-def cached_fetch(ref: Reference, mailto: str, try_pdf: bool):
-    return sources.fetch_online(ref, mailto, try_pdf)
+def cached_fetch(ref: Reference, mailto: str, try_pdf: bool, use_landing: bool):
+    return sources.fetch_online(ref, mailto, try_pdf, use_landing)
 
 
 @st.cache_resource(show_spinner="Memuat model embedding multibahasa (sekali saja)…")
-def get_embedder():
-    return nli.load_embedder(quantize=True)
+def get_embedder(quantize: bool):
+    return nli.load_embedder(quantize=quantize)
 
 
 @st.cache_resource(show_spinner="Memuat model NLI (sekali saja, ±1–2 menit pada pemakaian pertama)…")
-def get_scorer(model_name: str):
-    return nli.NLIScorer(model_name, quantize=True)
+def get_scorer(model_name: str, quantize: bool):
+    return nli.NLIScorer(model_name, quantize=quantize)
 
 
 # ---------------------------------------------------------------- sidebar
@@ -93,12 +93,19 @@ with st.sidebar:
         t_support = st.slider("Didukung jika entailment ≥", 0.5, 0.95, 0.70, 0.05)
         t_partial = st.slider("Didukung sebagian jika entailment ≥", 0.2, 0.7, 0.40, 0.05)
         t_contra = st.slider("Bertentangan jika kontradiksi ≥", 0.5, 0.95, 0.70, 0.05)
+    quantize = st.checkbox("Hemat memori (int8)", value=False,
+                           help="Aktifkan hanya bila aplikasi kehabisan memori. Bila operator int8 tidak "
+                                "didukung server, aplikasi otomatis kembali ke float32.")
 
     st.divider()
     st.subheader("Sumber artikel")
     online = st.checkbox("Cari artikel secara daring", value=True,
                          help="OpenAlex → PDF open access; bila gagal, abstrak dari OpenAlex/Crossref/Semantic Scholar.")
     try_pdf = st.checkbox("Coba unduh PDF open access", value=True, disabled=not online)
+    use_landing = st.checkbox("Baca halaman artikel di situs penerbit", value=True, disabled=not online,
+                              help="Lewat DOI/URL: ambil abstrak & PDF terbuka (termasuk jurnal OJS/SINTA). "
+                                   "Menghormati robots.txt dan memberi jeda antar-permintaan; tidak menembus "
+                                   "paywall atau login.")
     mailto = st.text_input("Email untuk OpenAlex (opsional)", value=secret("OPENALEX_MAILTO"),
                            help="Masuk ke 'polite pool' OpenAlex agar lebih stabil.")
 
@@ -192,7 +199,7 @@ if pdf_texts:
 # ---------------------------------------------------------------- langkah 1: sumber
 st.subheader("Langkah 1 · Siapkan teks artikel sumber")
 if st.button("📥 Siapkan artikel", type="primary" if st.session_state.docs is None else "secondary"):
-    docs, bar = {}, st.progress(0.0, "Menyiapkan…")
+    docs, logs, bar = {}, {}, st.progress(0.0, "Menyiapkan…")
     for n, idx in enumerate(cited, 1):
         ref = refs_by_idx[idx]
         bar.progress(n / len(cited), f"{n}/{len(cited)} · {ref.label}")
@@ -200,11 +207,14 @@ if st.button("📥 Siapkan artikel", type="primary" if st.session_state.docs is 
         if idx in mapping:
             doc = sources.build_from_fulltext(pdf_texts[mapping[idx]], idx,
                                               f"PDF unggahan: {mapping[idx]}", ref.title)
-        elif online and (ref.doi or len(ref.title) > 15):
-            doc = cached_fetch(ref, mailto, try_pdf)
+            logs[idx] = ["PDF diunggah pengguna"]
+        elif online and (ref.doi or ref.url or len(ref.title) > 15):
+            doc, logs[idx] = cached_fetch(ref, mailto, try_pdf, use_landing)
+        else:
+            logs[idx] = ["pencarian daring nonaktif atau DOI/judul tidak terbaca"]
         docs[idx] = doc
     bar.empty()
-    st.session_state.update(docs=docs, results=None)
+    st.session_state.update(docs=docs, fetch_logs=logs, results=None)
 
 docs = st.session_state.docs
 if docs is not None:
@@ -221,6 +231,18 @@ if docs is not None:
                "Klaim yang hanya dicek terhadap abstrak bisa berstatus 'tak dapat diverifikasi'.")
     st.dataframe(df_src, hide_index=True, width="stretch")
 
+    need = [refs_by_idx[i] for i in cited if not docs.get(i) or docs[i].coverage != "teks lengkap"]
+    if need:
+        with st.expander(f"📎 {len(need)} artikel sebaiknya diunggah PDF-nya (saat ini hanya abstrak/tidak tersedia)"):
+            st.caption("Unduh lewat langganan perpustakaan kampus, lalu unggah di kotak '2 · PDF artikel'. "
+                       "Aplikasi tidak menembus paywall penerbit.")
+            logs = st.session_state.get("fetch_logs", {})
+            for r in need:
+                link = f" · [buka](https://doi.org/{r.doi})" if r.doi else (f" · [buka]({r.url})" if r.url else "")
+                st.markdown(f"- **{r.label}** — {r.title}{link}  \n"
+                            f"  <span class='muted'>{html.escape(' → '.join(logs.get(r.idx, [])))}</span>",
+                            unsafe_allow_html=True)
+
 # ---------------------------------------------------------------- langkah 2: verifikasi
 st.subheader("Langkah 2 · Verifikasi sitasi")
 if docs is None:
@@ -231,9 +253,9 @@ if st.button("🧪 Jalankan verifikasi", type="primary" if st.session_state.resu
     embedder = scorer = None
     try:
         if use_emb:
-            embedder = get_embedder()
+            embedder = get_embedder(quantize)
         if use_nli:
-            scorer = get_scorer(nli.NLI_MODELS[nli_label])
+            scorer = get_scorer(nli.NLI_MODELS[nli_label], quantize)
     except ImportError:
         st.error("Paket torch/transformers/sentence-transformers belum terpasang. Lihat requirements.txt.")
         st.stop()

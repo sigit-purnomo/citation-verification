@@ -56,7 +56,13 @@ def run_verification(instances, refs: list[Reference], docs, passages_by_cid, ll
                         penjelasan="Teks artikel sumber tidak tersedia. Unggah PDF artikel ini atau aktifkan pencarian daring.",
                         catatan=[])
         elif nli_scorer is not None:
-            base.update(nli.judge(claim, passages, nli_scorer, doc.coverage, **(thresholds or {})))
+            try:
+                base.update(nli.judge(claim, passages, nli_scorer, doc.coverage, **(thresholds or {})))
+            except Exception as e:  # noqa: BLE001 - satu sitasi gagal tidak boleh menghentikan semuanya
+                base.update(verify.heuristic(claim, passages, doc.coverage))
+                base.update(verdict="GALAT",
+                            penjelasan=f"Model NLI gagal untuk sitasi ini ({type(e).__name__}); "
+                                       "ditampilkan kandidat evidence untuk ditinjau manual.")
         elif llm is None:
             base.update(verify.heuristic(claim, passages, doc.coverage))
         else:

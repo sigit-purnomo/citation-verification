@@ -8,6 +8,7 @@ Semua model diunduh gratis dari Hugging Face pada pemakaian pertama dan berjalan
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -20,46 +21,77 @@ NLI_MODELS = {
     "MiniLMv2 L6 (ringan, ±0,5 GB)": "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli",
 }
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+log = logging.getLogger("citecheck")
 
 
-def _quantize(model):
-    """Kuantisasi dinamis int8 untuk layer Linear: hemat RAM & lebih cepat di CPU."""
+def _quantize(model, probe):
+    """Kuantisasi dinamis int8 (hemat RAM). Hasilnya diuji dengan `probe`; bila operator int8
+    tidak didukung di server (mis. kombinasi Python/PyTorch tertentu), kembali ke model asli."""
     try:
         import torch
-        q = getattr(torch.ao.quantization, "quantize_dynamic", None) or torch.quantization.quantize_dynamic
-        return q(model, {torch.nn.Linear}, dtype=torch.qint8)
-    except Exception:  # noqa: BLE001 - tetap jalan tanpa kuantisasi
-        return model
+        engines = torch.backends.quantized.supported_engines
+        for eng in ("x86", "fbgemm", "qnnpack"):
+            if eng in engines:
+                torch.backends.quantized.engine = eng
+                break
+        qfn = getattr(torch.ao.quantization, "quantize_dynamic", None) or torch.quantization.quantize_dynamic
+        qmodel = qfn(model, {torch.nn.Linear}, dtype=torch.qint8)
+        with torch.inference_mode():
+            probe(qmodel)
+        return qmodel, True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Kuantisasi int8 tidak tersedia, memakai float32: %s", e)
+        return model, False
 
 
-def load_embedder(quantize: bool = True):
+def load_embedder(quantize: bool = False):
     from sentence_transformers import SentenceTransformer
     m = SentenceTransformer(EMBED_MODEL, device="cpu")
-    return _quantize(m) if quantize else m
+    if quantize:
+        m, _ = _quantize(m, lambda q: q.encode(["uji coba kalimat"]))
+    return m
 
 
 class NLIScorer:
-    def __init__(self, model_name: str, quantize: bool = True, max_length: int = 256):
+    def __init__(self, model_name: str, quantize: bool = False, max_length: int = 256):
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         torch.set_num_threads(max(1, os.cpu_count() or 1))
-        self.torch = torch
+        self.torch, self.model_name, self.max_length = torch, model_name, max_length
         self.tok = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForSequenceClassification.from_pretrained(model_name).eval()
         labels = {i: str(l).lower() for i, l in model.config.id2label.items()}
         self.ix = [next(i for i, l in labels.items() if l.startswith(k)) for k in ("entail", "neutral", "contra")]
-        self.model = _quantize(model) if quantize else model
-        self.max_length = max_length
+        self.quantized = False
+        if quantize:
+            model, self.quantized = _quantize(model, lambda q: q(**self._encode([("Tes premis.", "Tes hipotesis.")])))
+        self.model = model
+
+    def _encode(self, chunk):
+        return self.tok([p for p, _ in chunk], [h for _, h in chunk], truncation="only_first",
+                        padding=True, max_length=self.max_length, return_tensors="pt")
+
+    def _fallback_fp32(self):
+        """Muat ulang model float32 (dari cache disk) bila operator int8 gagal saat dipakai."""
+        from transformers import AutoModelForSequenceClassification
+        log.warning("Operator int8 gagal saat inferensi; beralih ke float32.")
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name).eval()
+        self.quantized = False
 
     def score(self, pairs: list[tuple[str, str]], batch_size: int = 16) -> np.ndarray:
         """Kembalikan array (n, 3): [entailment, neutral, contradiction]."""
         out = []
         with self.torch.inference_mode():
             for s in range(0, len(pairs), batch_size):
-                chunk = pairs[s:s + batch_size]
-                enc = self.tok([p for p, _ in chunk], [h for _, h in chunk], truncation="only_first",
-                               padding=True, max_length=self.max_length, return_tensors="pt")
-                probs = self.torch.softmax(self.model(**enc).logits, dim=-1).numpy()
+                enc = self._encode(pairs[s:s + batch_size])
+                try:
+                    logits = self.model(**enc).logits
+                except RuntimeError:
+                    if not self.quantized:
+                        raise
+                    self._fallback_fp32()
+                    logits = self.model(**enc).logits
+                probs = self.torch.softmax(logits.float(), dim=-1).numpy()
                 out.append(probs[:, self.ix])
         return np.vstack(out) if out else np.zeros((0, 3))
 

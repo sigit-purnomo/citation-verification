@@ -19,6 +19,20 @@ Model (gratis, diunduh otomatis pada pemakaian pertama, berjalan di CPU, dikuant
 | NLI (default) | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` |
 | NLI (hemat memori) | `MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli` |
 
+## Sumber teks artikel (berlapis)
+
+1. **PDF unggahan** pengusul — paling akurat, dan jalur sah untuk artikel berbayar
+   (diunduh sendiri lewat langganan perpustakaan).
+2. **Metadata terbuka**: OpenAlex, Crossref, Semantic Scholar (gratis, tanpa kunci) → PDF open access.
+3. **Halaman artikel penerbit** (`citecheck/landing.py`): DOI/URL → metadata `citation_*`/Dublin Core
+   di halaman → abstrak + PDF terbuka. Menangani pola OJS (`/article/view/` → `/article/download/`),
+   sehingga jurnal nasional/SINTA yang terbuka biasanya terbaca teks lengkapnya.
+   Sopan: menghormati robots.txt, jeda 2 detik per domain, User-Agent jujur, tidak menembus
+   paywall/login/CAPTCHA.
+
+Artikel yang hanya terbaca abstraknya didaftar di aplikasi beserta jejak alasannya
+(mis. "HTTP 403", "bukan PDF (kemungkinan berbayar)") supaya pengusul tahu PDF mana yang perlu diunggah.
+
 ## Menjalankan lokal
 
 ```bash
@@ -30,7 +44,8 @@ streamlit run app.py
 
 1. Unggah isi folder ini ke repositori GitHub (boleh privat). Folder `contoh/` opsional.
 2. Di https://share.streamlit.io → **Create app** → pilih repo, branch, dan `app.py`.
-   Di *Advanced settings* pilih Python 3.11 atau 3.12.
+   Di *Advanced settings* pilih **Python 3.12** (lebih stabil untuk PyTorch daripada 3.14).
+   Versi Python hanya bisa dipilih saat deploy; untuk menggantinya, hapus app lalu deploy ulang.
 3. (Opsional) *Secrets*: `OPENALEX_MAILTO = "nama@kampus.ac.id"`.
 4. Proposal bersifat rahasia: setelah deploy, buka **Settings → Sharing** dan batasi siapa yang
    boleh melihat aplikasi.
@@ -39,7 +54,8 @@ Catatan kapasitas:
 - Pemakaian pertama mengunduh model (±1,5 GB) sehingga butuh beberapa menit; setelah itu model
   di-cache dan dipakai bersama oleh semua pengguna.
 - Batas memori Community Cloud terbatas (dokumentasi Streamlit menyebut maksimal ±2,7 GB).
-  Bila muncul pesan *"over its resource limits"*, pilih model NLI **MiniLMv2** di sidebar,
+  Model berjalan dalam float32 secara default. Bila muncul pesan *"over its resource limits"*,
+  aktifkan *Hemat memori (int8)* (otomatis kembali ke float32 bila tidak didukung) atau pilih model NLI **MiniLMv2**,
   atau pindahkan aplikasi ke Hugging Face Spaces (Streamlit didukung, RAM lebih besar).
 - CPU hanya beberapa core: untuk ±100 sitasi, perkirakan beberapa menit.
 
@@ -72,6 +88,7 @@ app.py                  UI Streamlit
 citecheck/parsing.py    ekstraksi teks PDF/DOCX, parsing daftar pustaka
 citecheck/citations.py  pemecahan kalimat, deteksi & pemetaan sitasi
 citecheck/sources.py    teks artikel (unggahan/daring), segmentasi bagian
+citecheck/landing.py    pembaca halaman artikel penerbit (lapis 2)
 citecheck/retrieval.py  pencarian passage kandidat
 citecheck/nli.py        penilaian tanpa LLM (NLI) + pemuatan model
 citecheck/verify.py     (opsional) penilaian LLM + verifikasi kutipan, tidak dipakai di UI

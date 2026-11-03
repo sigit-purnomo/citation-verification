@@ -10,6 +10,9 @@ import requests
 from rapidfuzz import fuzz
 
 from .citations import split_sentences
+from urllib.parse import urlparse
+
+from . import landing
 from .parsing import DOI_RE, Reference, extract_text, fold, norm_ws
 
 UA = "CiteCheck/1.0 (citation verification tool)"
@@ -181,22 +184,6 @@ def _inverted_to_text(inv: dict | None) -> str:
     return " ".join(w for _, w in pos)
 
 
-def _download_pdf(url: str, limit=30_000_000) -> bytes | None:
-    try:
-        with requests.get(url, timeout=30, stream=True,
-                          headers={"User-Agent": "Mozilla/5.0 " + UA}) as r:
-            if r.status_code != 200:
-                return None
-            data = b""
-            for chunk in r.iter_content(1 << 16):
-                data += chunk
-                if len(data) > limit:
-                    return None
-            return data if data[:5] == b"%PDF-" else None
-    except requests.RequestException:
-        return None
-
-
 def _crossref_abstract(doi: str) -> str:
     r = _get(f"https://api.crossref.org/works/{doi}")
     if not r:
@@ -221,34 +208,75 @@ def _s2(ref: Reference) -> tuple[str, str]:
     return "", ""
 
 
-def fetch_online(ref: Reference, mailto: str = "", try_pdf: bool = True) -> SourceDoc | None:
-    """Cari artikel secara daring. Teks lengkap OA bila bisa, kalau tidak abstrak."""
+def fetch_online(ref: Reference, mailto: str = "", try_pdf: bool = True,
+                 use_landing: bool = True) -> tuple[SourceDoc | None, list[str]]:
+    """Cari teks artikel secara daring. Mengembalikan (dokumen, log langkah).
+
+    Lapis 1: OpenAlex/Crossref/Semantic Scholar (metadata terbuka) → PDF open access.
+    Lapis 2: halaman artikel di situs penerbit (via DOI/URL) → abstrak & PDF terbuka.
+    Teks lengkap diutamakan; bila tidak ada, dipakai abstrak terbaik yang ditemukan.
+    """
+    log: list[str] = []
     work = _openalex(ref, mailto)
+    log.append("OpenAlex: ditemukan" if work else "OpenAlex: tidak ditemukan")
     title = (work or {}).get("title") or ref.title
-    landing = ((work or {}).get("doi") or (f"https://doi.org/{ref.doi}" if ref.doi else ref.url))
-    abstract = _inverted_to_text((work or {}).get("abstract_inverted_index"))
+    doi = ref.doi or ((work or {}).get("doi") or "").replace("https://doi.org/", "")
+    landing_url = f"https://doi.org/{doi}" if doi else ref.url
+    abstracts: list[tuple[str, str]] = []  # (sumber, teks)
+    ab = _inverted_to_text((work or {}).get("abstract_inverted_index"))
+    if ab:
+        abstracts.append(("abstrak OpenAlex", ab))
+
     pdf_urls = []
     if work:
         for loc in [work.get("best_oa_location")] + (work.get("locations") or []):
             if loc and loc.get("pdf_url") and loc["pdf_url"] not in pdf_urls:
                 pdf_urls.append(loc["pdf_url"])
-    if not abstract and ref.doi:
-        abstract = _crossref_abstract(ref.doi)
-    if not abstract or not pdf_urls:
+    if not abstracts and doi:
+        ab = _crossref_abstract(doi)
+        if ab:
+            abstracts.append(("abstrak Crossref", ab))
+    if not abstracts or not pdf_urls:
         ab2, pdf2 = _s2(ref)
-        abstract = abstract or ab2
+        if ab2:
+            abstracts.append(("abstrak Semantic Scholar", ab2))
         if pdf2:
             pdf_urls.append(pdf2)
 
-    if try_pdf:
-        for u in pdf_urls[:3]:
-            data = _download_pdf(u)
+    def try_pdfs(urls, origin) -> SourceDoc | None:
+        for u in urls[:3]:
+            data, status = landing.download_pdf(u)
+            log.append(f"PDF {urlparse(u).netloc}: {status}")
             if data:
-                doc = build_from_fulltext(extract_text(data, "a.pdf"), ref.idx,
-                                          "PDF open access (daring)", title, u)
+                doc = build_from_fulltext(extract_text(data, "a.pdf"), ref.idx, origin, title, u)
                 if len(doc.sentences) > 40:
                     return doc
-    if abstract:
-        src = "abstrak OpenAlex/Crossref/Semantic Scholar"
-        return build_from_abstract(abstract, ref.idx, src, title, landing or "")
-    return None
+                log.append("PDF terbaca tetapi teksnya terlalu sedikit (mungkin hasil pindai)")
+        return None
+
+    if try_pdf and pdf_urls:
+        doc = try_pdfs(pdf_urls, "PDF open access (OpenAlex/Semantic Scholar)")
+        if doc:
+            return doc, log
+
+    # ---- lapis 2: halaman penerbit
+    if use_landing and (landing_url or ref.url):
+        info, status = landing.read_landing(doi, "" if doi else ref.url)
+        log.append(f"Halaman penerbit: {status}")
+        if info and (not ref.title or not info["title"] or _title_ok(ref, info["title"])):
+            host = urlparse(info["url"]).netloc
+            new_pdfs = [u for u in info["pdf_urls"] if u not in pdf_urls]
+            if try_pdf and new_pdfs:
+                doc = try_pdfs(new_pdfs, f"PDF dari halaman penerbit ({host})")
+                if doc:
+                    return doc, log
+            if info["abstract"]:
+                abstracts.append((f"abstrak halaman penerbit ({host})", info["abstract"]))
+            landing_url = info["url"]
+        elif info:
+            log.append("Halaman penerbit: judul tidak cocok, diabaikan")
+
+    if abstracts:
+        src, text = max(abstracts, key=lambda x: len(x[1]))  # abstrak terlengkap
+        return build_from_abstract(text, ref.idx, src, title, landing_url or ""), log
+    return None, log
