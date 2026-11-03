@@ -13,7 +13,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-from citecheck import pipeline, sources, verify
+from citecheck import nli, pipeline, sources
 from citecheck.citations import strip_citations
 from citecheck.parsing import Reference, extract_text
 
@@ -69,27 +69,30 @@ def cached_fetch(ref: Reference, mailto: str, try_pdf: bool):
     return sources.fetch_online(ref, mailto, try_pdf)
 
 
-@st.cache_resource(show_spinner="Memuat model embedding multibahasa…")
-def load_embedder():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+@st.cache_resource(show_spinner="Memuat model embedding multibahasa (sekali saja)…")
+def get_embedder():
+    return nli.load_embedder(quantize=True)
+
+
+@st.cache_resource(show_spinner="Memuat model NLI (sekali saja, ±1–2 menit pada pemakaian pertama)…")
+def get_scorer(model_name: str):
+    return nli.NLIScorer(model_name, quantize=True)
 
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ Pengaturan")
-    mode = st.radio("Mesin penilai", ["Claude (Anthropic API)", "API kompatibel OpenAI", "Tanpa LLM (heuristik)"],
-                    help="LLM dipakai untuk menerjemahkan klaim menjadi query dan menilai kesesuaian. "
-                         "Tanpa LLM, aplikasi hanya menampilkan passage kandidat.")
-    api_key, model, base_url = "", "", ""
-    if mode.startswith("Claude"):
-        api_key = st.text_input("ANTHROPIC_API_KEY", value=secret("ANTHROPIC_API_KEY"), type="password")
-        model = st.text_input("Model", value=secret("CITECHECK_MODEL") or "claude-sonnet-5-5")
-    elif mode.startswith("API"):
-        base_url = st.text_input("Base URL", value=secret("OPENAI_BASE_URL"),
-                                 placeholder="https://…/v1 (kosongkan untuk OpenAI)")
-        api_key = st.text_input("API key", value=secret("OPENAI_API_KEY"), type="password")
-        model = st.text_input("Model", value=secret("CITECHECK_MODEL") or "gpt-4.1-mini")
+    mode = st.radio("Mode penilaian", ["NLI lokal (verdict otomatis)", "Kandidat evidence saja (tercepat)"],
+                    help="Tanpa LLM. NLI lokal memakai model Hugging Face gratis di CPU untuk menilai apakah "
+                         "kalimat artikel mendukung/bertentangan dengan klaim.")
+    use_nli = mode.startswith("NLI")
+    nli_label = st.selectbox("Model NLI", list(nli.NLI_MODELS), disabled=not use_nli,
+                             help="mDeBERTa lebih akurat dan dilatih untuk banyak bahasa termasuk Indonesia; "
+                                  "MiniLMv2 lebih hemat memori.")
+    with st.expander("Ambang verdict", expanded=False):
+        t_support = st.slider("Didukung jika entailment ≥", 0.5, 0.95, 0.70, 0.05)
+        t_partial = st.slider("Didukung sebagian jika entailment ≥", 0.2, 0.7, 0.40, 0.05)
+        t_contra = st.slider("Bertentangan jika kontradiksi ≥", 0.5, 0.95, 0.70, 0.05)
 
     st.divider()
     st.subheader("Sumber artikel")
@@ -100,11 +103,9 @@ with st.sidebar:
                            help="Masuk ke 'polite pool' OpenAlex agar lebih stabil.")
 
     st.divider()
-    st.subheader("Pencarian evidence")
     top_k = st.slider("Kalimat kandidat per sitasi", 4, 15, 8)
-    use_emb = st.checkbox("Embedding multibahasa (ID↔EN)", value=False,
-                          help="Butuh paket sentence-transformers (~500 MB model). Membantu pencarian lintas bahasa.")
-    workers = st.slider("Panggilan paralel", 1, 8, 4)
+    use_emb = st.checkbox("Pencarian lintas bahasa (embedding)", value=True,
+                          help="Wajib bila proposal berbahasa Indonesia dan artikel berbahasa Inggris.")
 
 # ---------------------------------------------------------------- header
 st.title("🔎 CiteCheck")
@@ -117,9 +118,9 @@ with st.expander("Bagaimana cara kerjanya? (rekayasa balik alur evidence ala Con
 2. **Petakan sitasi ke daftar pustaka** (nama penulis pertama + tahun, termasuk sufiks 2025a/b) dan ambil DOI/judul.
 3. **Ambil teks artikel**: PDF yang Anda unggah (paling andal) atau daring — OpenAlex → PDF open access → abstrak (OpenAlex/Crossref/Semantic Scholar).
 4. **Segmentasi artikel per bagian** (ABSTRACT, INTRODUCTION, RESULTS, DISCUSSION…) dan per kalimat; daftar pustaka artikel dibuang. Kalimat yang sendirinya mengutip studi lain ditandai **sekunder** — inilah mengapa Consensus menampilkan label seperti `INTRODUCTION (#2)` dengan rujukan `[44-46]`.
-5. **Retrieval**: klaim (plus terjemahan query Inggris dari LLM) dicari dengan BM25 dan opsional embedding multibahasa, digabung *reciprocal rank fusion*; bagian temuan diberi bobot lebih.
-6. **Penilaian + kutipan verbatim**: LLM memilih kutipan *persis* dari passage dan memberi peran (mendukung / membatasi / bertentangan / latar) serta verdict.
-7. **Grounding check**: setiap kutipan dicocokkan ulang ke teks artikel. Kutipan yang tidak ditemukan diberi tanda ✗, sehingga evidence tidak bisa dikarang.
+5. **Retrieval**: klaim dicari dengan BM25 + embedding multibahasa (Indonesia ↔ Inggris), digabung *reciprocal rank fusion*; bagian temuan diberi bobot lebih.
+6. **Penilaian tanpa LLM (NLI)**: setiap kalimat kandidat (premis) dipasangkan dengan klaim (hipotesis); model NLI multibahasa memberi skor *entailment / netral / kontradiksi*. Skor tertinggi menentukan verdict, dan kalimat dengan skor tertinggi menjadi evidence.
+7. **Kutipan selalu verbatim**: evidence adalah kalimat asli artikel, bukan teks buatan model, sehingga tidak mungkin dikarang.
 """)
 
 c1, c2 = st.columns(2)
@@ -227,27 +228,23 @@ if docs is None:
     st.stop()
 
 if st.button("🧪 Jalankan verifikasi", type="primary" if st.session_state.results is None else "secondary"):
-    llm = None
-    if not mode.startswith("Tanpa"):
-        if not api_key and not base_url:
-            st.error("Isi API key di sidebar, atau pilih mode 'Tanpa LLM'.")
-            st.stop()
-        llm = verify.LLM("anthropic" if mode.startswith("Claude") else "openai", api_key, model, base_url)
-    embedder = None
-    if use_emb:
-        try:
-            embedder = load_embedder()
-        except ImportError:
-            st.warning("sentence-transformers belum terpasang; lanjut tanpa embedding.")
-    with st.spinner("Menyusun query pencarian lintas bahasa…"):
-        claims = [strip_citations(i.sentence) for i in instances]
-        q_en = verify.make_queries(llm, claims) if llm else [""] * len(claims)
-    with st.spinner("Mencari passage kandidat di setiap artikel…"):
-        passages = pipeline.retrieve_all(instances, docs, q_en, top_k, embedder)
+    embedder = scorer = None
+    try:
+        if use_emb:
+            embedder = get_embedder()
+        if use_nli:
+            scorer = get_scorer(nli.NLI_MODELS[nli_label])
+    except ImportError:
+        st.error("Paket torch/transformers/sentence-transformers belum terpasang. Lihat requirements.txt.")
+        st.stop()
+    with st.spinner("Mencari kalimat kandidat di setiap artikel…"):
+        passages = pipeline.retrieve_all(instances, docs, [""] * len(instances), top_k, embedder,
+                                         window=0 if use_nli else 1)
     bar = st.progress(0.0, "Menilai…")
     results = pipeline.run_verification(
-        instances, refs, docs, passages, llm, workers,
-        on_progress=lambda n, t: bar.progress(n / t, f"Menilai sitasi {n}/{t}"))
+        instances, refs, docs, passages, None, 1,
+        on_progress=lambda n, t: bar.progress(n / t, f"Menilai sitasi {n}/{t}"),
+        nli_scorer=scorer, thresholds=dict(t_support=t_support, t_partial=t_partial, t_contra=t_contra))
     bar.empty()
     st.session_state.results = results
 
@@ -273,9 +270,10 @@ def evidence_html(b: dict) -> str:
           "mirip": (f'<span class="qv-mid">≈ mirip ({b.get("skor", 0):.0f}%)</span>'),
           "tidak ditemukan": '<span class="qv-bad">✗ tidak ditemukan di artikel</span>'}[b["status"]]
     color = ROLE_STYLE.get(b["peran"], "#6e7781")
+    nli_txt = f' · skor NLI {b["nli"]:.2f}' if b.get("nli") is not None else ""
     return (f'<div class="ev" style="border-left-color:{color}">'
             f'<div class="ev-head">❝ {html.escape(b["section"])} ({html.escape(str(b["pid"]))})'
-            f'<span class="role" style="color:{color}">{html.escape(b["peran"])}</span> · {qv}</div>'
+            f'<span class="role" style="color:{color}">{html.escape(b["peran"])}</span> · {qv}{nli_txt}</div>'
             f'<div class="ev-q">“{html.escape(b["kutipan"])}”</div></div>')
 
 

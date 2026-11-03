@@ -7,7 +7,7 @@ from .citations import CitationInstance, extract_instances, strip_citations
 from .parsing import Reference, extract_text, parse_references, split_body_refs
 from .retrieval import Retriever, build_passages
 from .sources import SourceDoc
-from . import verify
+from . import nli, verify
 
 
 def parse_proposal(data: bytes, filename: str):
@@ -20,7 +20,7 @@ def parse_proposal(data: bytes, filename: str):
 
 
 def retrieve_all(instances: list[CitationInstance], docs: dict[int, SourceDoc | None],
-                 queries_en: list[str], top_k: int = 8, embedder=None) -> dict[int, list]:
+                 queries_en: list[str], top_k: int = 8, embedder=None, window: int = 1) -> dict[int, list]:
     retrievers = {i: Retriever(d, embedder) for i, d in docs.items() if d and d.sentences}
     out = {}
     for inst, q_en in zip(instances, queries_en):
@@ -33,12 +33,14 @@ def retrieve_all(instances: list[CitationInstance], docs: dict[int, SourceDoc | 
             out[inst.cid] = build_passages(doc, idxs, window=0)
         else:
             idxs = retrievers[inst.ref_idx].search([strip_citations(inst.sentence), q_en], k=top_k)
-            out[inst.cid] = build_passages(doc, idxs, window=1)
+            out[inst.cid] = build_passages(doc, idxs, window=window)
     return out
 
 
 def run_verification(instances, refs: list[Reference], docs, passages_by_cid, llm=None,
-                     workers: int = 4, on_progress=None) -> list[dict]:
+                     workers: int = 4, on_progress=None, nli_scorer=None, thresholds=None) -> list[dict]:
+    if nli_scorer is not None:
+        workers = 1  # model NLI sudah memakai semua core CPU
     by_idx = {r.idx: r for r in refs}
 
     def one(inst: CitationInstance) -> dict:
@@ -53,6 +55,8 @@ def run_verification(instances, refs: list[Reference], docs, passages_by_cid, ll
             base.update(verdict="TIDAK_DAPAT_DIVERIFIKASI", keyakinan=None, klaim_inti=claim, bukti=[],
                         penjelasan="Teks artikel sumber tidak tersedia. Unggah PDF artikel ini atau aktifkan pencarian daring.",
                         catatan=[])
+        elif nli_scorer is not None:
+            base.update(nli.judge(claim, passages, nli_scorer, doc.coverage, **(thresholds or {})))
         elif llm is None:
             base.update(verify.heuristic(claim, passages, doc.coverage))
         else:

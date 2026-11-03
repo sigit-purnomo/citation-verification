@@ -1,3 +1,11 @@
+# PyTorch versi CPU (jauh lebih kecil daripada versi CUDA) — cocok untuk Streamlit Community Cloud
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers>=4.40
+sentence-transformers>=3.0
+sentencepiece
+protobuf
+
 streamlit>=1.40
 pymupdf>=1.24
 python-docx>=1.1
@@ -7,7 +15,3 @@ numpy
 pandas
 openpyxl
 requests
-anthropic>=0.40
-openai>=1.40
-# Opsional, untuk pencarian lintas bahasa ID<->EN tanpa LLM (unduhan model ~500 MB):
-# sentence-transformers>=3.0
